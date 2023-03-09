@@ -1,0 +1,9 @@
+{
+  "name": "threadtest",
+  "version-string": "1.0.0",
+  "dependencies": [
+    {
+      "name": "boost-process"
+    }
+  ]
+}
