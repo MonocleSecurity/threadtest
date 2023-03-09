@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <boost/algorithm/string.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/connect_pipe.hpp>
 #include <boost/process.hpp>
@@ -10,17 +11,18 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
 
-const size_t num_threads = 16;//TODO
+const size_t num_threads = 32;
 const size_t num_futures = num_threads + 1;
 const size_t num_pipes = num_threads + 1;
 const size_t num_condition_variables = num_threads + 1;
 const size_t num_sockets = num_threads + 1;
 
-void Atomic(const std::chrono::milliseconds loop_delay)
+void atomic()
 {
   // Initialise
   std::array<std::unique_ptr<std::atomic<bool>>, num_threads> values;
@@ -38,7 +40,7 @@ void Atomic(const std::chrono::milliseconds loop_delay)
     {
       nextvalue = values[i + 1u].get();
     }
-    threads[i] = std::thread([loop_delay, currentvalue, nextvalue]()
+    threads[i] = std::thread([currentvalue, nextvalue]()
       {
         while (true)
         {
@@ -52,27 +54,21 @@ void Atomic(const std::chrono::milliseconds loop_delay)
               return;
             }
           }
-          if (loop_delay == std::chrono::milliseconds::zero())
-          {
-            std::this_thread::yield();
-          }
-          else
-          {
-            std::this_thread::sleep_for(loop_delay);
-          }
+          std::this_thread::yield();
         }
       });
   }
   // Run
+  std::this_thread::sleep_for(std::chrono::seconds(1));
   const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   *values[0] = true;
   threads.back().join();
   const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-  std::cout << "Atomic latency" << (loop_delay == std::chrono::milliseconds::zero() ? "(yield)" : "(" + std::to_string(loop_delay.count()) + "ms)") << ": " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
+  std::cout << "Atomic latency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
   std::for_each(threads.begin(), threads.end(), [](std::thread& thread) { if (thread.joinable()) { thread.join(); } });
 }
 
-void MutexVector(const std::chrono::milliseconds loop_delay)
+void mutex_vector()
 {
   // Initialise
   std::array<std::unique_ptr<std::mutex>, num_threads> mutexes;
@@ -95,7 +91,7 @@ void MutexVector(const std::chrono::milliseconds loop_delay)
       nextmutex = mutexes[i + 1u].get();
       nextvalue = values[i + 1u].get();
     }
-    threads[i] = std::thread([loop_delay, currentmutex, currentvalue, nextmutex, nextvalue]()
+    threads[i] = std::thread([currentmutex, currentvalue, nextmutex, nextvalue]()
       {
         while (true)
         {
@@ -111,18 +107,12 @@ void MutexVector(const std::chrono::milliseconds loop_delay)
               return;
             }
           }
-          if (loop_delay == std::chrono::milliseconds::zero())
-          {
-            std::this_thread::yield();
-          }
-          else
-          {
-            std::this_thread::sleep_for(loop_delay);
-          }
+          std::this_thread::yield();
         }
       });
   }
   // Run
+  std::this_thread::sleep_for(std::chrono::seconds(1));
   const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(*mutexes[0]);
@@ -130,8 +120,15 @@ void MutexVector(const std::chrono::milliseconds loop_delay)
   }
   threads.back().join();
   const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-  std::cout << "Mutex latency" << (loop_delay == std::chrono::milliseconds::zero() ? "(yield)" : "(" + std::to_string(loop_delay.count()) + "ms)") << ": " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
+  std::cout << "Mutex latency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
   std::for_each(threads.begin(), threads.end(), [](std::thread& thread) { if (thread.joinable()) { thread.join(); } });
+}
+
+std::pair<double, double> standard_deviation(const std::vector<double>& values)
+{
+  const double mean = std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+  const double sq_sum = std::inner_product(values.begin(), values.end(), values.begin(), 0.0, [](double const& x, double const& y) { return x + y; }, [mean](double const& x, double const& y) { return (x - mean) * (y - mean); });
+  return std::make_pair(mean, std::sqrt(sq_sum / values.size()));
 }
 
 int main()
@@ -148,36 +145,50 @@ int main()
     }
     // Setup
     std::array<std::thread, num_threads> threads;
+    std::array<std::chrono::steady_clock::time_point, num_threads> times;
     for (size_t i = 0; i < num_threads; ++i)
     {
+      std::chrono::steady_clock::time_point* time = &times[i];
       std::promise<void>* promise = promises[i + 1u].get();
       std::future<void>* future = futures[i].get();
-      threads[i] = std::thread([promise, future]()
+      threads[i] = std::thread([time, promise, future]()
         {
           future->get();
+          const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
           if (promise)
           {
             promise->set_value();
           }
+          *time = now;
         });
     }
     // Run
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     promises.front()->set_value();
     futures.back()->get();
     const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
     // Log and clean up
-    std::cout << "Future latency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
+    std::cout << "Future total latency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;
+    std::vector<double> durations;
+    durations.reserve(num_threads);
+    for (size_t i = 0; (i + 1u) < num_threads; ++i)
+    {
+      const int64_t microseconds = std::chrono::duration_cast<std::chrono::microseconds>(times[i + 1u] - times[i]).count();
+      durations.push_back(static_cast<double>(microseconds));
+    }
+    const std::pair<double, double> stddev = standard_deviation(durations);
+    auto minmax = std::minmax_element(durations.begin(), durations.end());
+    std::cout << "  min: " << *minmax.first << std::endl;
+    std::cout << "  max: " << *minmax.second << std::endl;
+    std::cout << "  mean: " << stddev.first << std::endl;
+    std::cout << "  stddev: " << stddev.second << std::endl;
     std::for_each(threads.begin(), threads.end(), [](std::thread& thread) { thread.join(); });
   }
   // Mutex+Vector
-  MutexVector(std::chrono::milliseconds(0)); // yield()
-  MutexVector(std::chrono::milliseconds(10)); // sleep_for()
-  MutexVector(std::chrono::milliseconds(40)); // sleep_for()
+  mutex_vector();
   // Atomic
-  Atomic(std::chrono::milliseconds(0)); // yield()
-  Atomic(std::chrono::milliseconds(10)); // sleep_for()
-  Atomic(std::chrono::milliseconds(40)); // sleep_for()
+  atomic();
   // Conditional Variable
   {
     // Initialise
@@ -212,6 +223,7 @@ int main()
         });
     }
     // Run
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     {
       std::unique_lock<std::mutex> lock(*mutexes.front());
@@ -258,6 +270,7 @@ int main()
         });
     }
     // Run
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     if (pipes.front()->write("a", 1) != 1)
     {
@@ -321,6 +334,7 @@ int main()
         });
     }
     // Run
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     if (write_sockets.front()->write_some(boost::asio::buffer("a", 1)) != 1)
     {
